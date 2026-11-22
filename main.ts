@@ -1,283 +1,18 @@
-// One Strawberry, Glossy and Ripe
-// A make.fun bounty entry: draws a single ripe strawberry with a small
-// software rasterizer and writes it as a PNG using only the Node stdlib.
+// One Strawberry — a single glossy ripe strawberry, drawn with a small
+// software rasterizer and encoded as a PNG with only the Node stdlib.
 //
-// Run:  node main.ts            (writes to /output/entry.png)
-//       OUTPUT_DIR=/tmp/out node main.ts   (writes to a local temp dir)
-import { createHash } from "node:crypto";
-import { deflateSync } from "node:zlib";
+// Run:  node main.ts            (writes /output/entry.png)
+//       OUTPUT_DIR=/tmp/out node main.ts
+//
+// The picture is one ingredient only: a big ripe strawberry on a warm,
+// simple background, lit from the upper left. No text, no props.
+
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-
-const W = 900;
-const H = 900;
+import { deflateSync } from "node:zlib";
 
 // ---------------------------------------------------------------------------
-// Tiny raster helpers
-// ---------------------------------------------------------------------------
-type RGB = [number, number, number];
-
-const px = new Uint8Array(W * H * 3);
-
-function setPixel(x: number, y: number, c: RGB): void {
-  if (x < 0 || x >= W || y < 0 || y >= H) return;
-  const i = (y * W + x) * 3;
-  px[i] = c[0];
-  px[i + 1] = c[1];
-  px[i + 2] = c[2];
-}
-
-function getPixel(x: number, y: number): RGB {
-  const i = (y * W + x) * 3;
-  return [px[i], px[i + 1], px[i + 2]];
-}
-
-function blend(x: number, y: number, c: RGB, a: number): void {
-  if (a <= 0) return;
-  if (a >= 1) return setPixel(x, y, c);
-  const [r, g, b] = getPixel(x, y);
-  setPixel(x, y, [
-    Math.round(r + (c[0] - r) * a),
-    Math.round(g + (c[1] - g) * a),
-    Math.round(b + (c[2] - b) * a),
-  ]);
-}
-
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
-
-function mix(c1: RGB, c2: RGB, t: number): RGB {
-  return [
-    Math.round(lerp(c1[0], c2[0], t)),
-    Math.round(lerp(c1[1], c2[1], t)),
-    Math.round(lerp(c1[2], c2[2], t)),
-  ];
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
-
-// Soft filled ellipse (with a feathered edge of `feather` pixels).
-function ellipse(
-  cx: number,
-  cy: number,
-  rx: number,
-  ry: number,
-  c: RGB,
-  a: number,
-  feather = 1.5,
-): void {
-  const x0 = Math.max(0, Math.floor(cx - rx - feather));
-  const x1 = Math.min(W - 1, Math.ceil(cx + rx + feather));
-  const y0 = Math.max(0, Math.floor(cy - ry - feather));
-  const y1 = Math.min(H - 1, Math.ceil(cy + ry + feather));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const dx = (x - cx) / rx;
-      const dy = (y - cy) / ry;
-      const d = dx * dx + dy * dy;
-      if (d >= 1 + feather / rx) continue;
-      const edge = clamp((1 - d) / (feather / rx), 0, 1);
-      blend(x, y, c, a * edge);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Background: warm cream with a soft radial glow behind the berry
-// ---------------------------------------------------------------------------
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const dx = (x - 450) / 520;
-    const dy = (y - 430) / 520;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    const glow = clamp(1 - d, 0, 1);
-    // Warm cream centre fading to a soft peach edge.
-    const base = mix([248, 232, 205], [242, 205, 168], clamp(d * 0.9, 0, 1));
-    const lit = mix(base, [255, 246, 226], glow * 0.55);
-    setPixel(x, y, lit);
-  }
-}
-
-// Soft ground shadow under the berry.
-ellipse(450, 800, 250, 46, [150, 80, 40], 0.22, 26);
-ellipse(450, 798, 205, 34, [140, 70, 35], 0.20, 20);
-
-// ---------------------------------------------------------------------------
-// Strawberry body
-// ---------------------------------------------------------------------------
-// Body outline: t goes 0 (top, shoulders) to 1 (bottom tip).
-const TOP = 300;
-const BOT = 790;
-const CX = 450;
-
-function halfWidth(t: number): number {
-  // Wide shoulders, gentle taper to a rounded point at the tip.
-  const tt = clamp(t, 0, 1);
-  const shoulder = Math.sin(Math.min(tt / 0.5, 1) * Math.PI * 0.5);
-  const taper = Math.pow(Math.max(0, 1 - tt), 0.62);
-  return 8 + 190 * shoulder * (0.05 + 0.95 * taper) * (1 - 0.25 * tt * tt);
-}
-
-function bodyAt(x: number, y: number): number {
-  // Returns 1 inside the body, 0 outside, feathered at the edge.
-  if (y < TOP - 4 || y > BOT + 4) return 0;
-  const t = clamp((y - TOP) / (BOT - TOP), 0, 1);
-  const hw = halfWidth(t);
-  const d = Math.abs(x - CX) / hw;
-  if (d >= 1.02) return 0;
-  if (d <= 0.985) return 1;
-  return clamp((1.02 - d) / 0.035, 0, 1);
-}
-
-// Seed positions, laid out in gentle curved rows across the body.
-type Seed = { x: number; y: number; s: number; rot: number };
-const seeds: Seed[] = [];
-for (let row = 0; row < 9; row++) {
-  const t = 0.10 + row * 0.095;
-  const y = TOP + t * (BOT - TOP);
-  const hw = halfWidth(t) * 0.86;
-  const count = 3 + Math.floor(hw / 52);
-  for (let k = 0; k < count; k++) {
-    const f = count === 1 ? 0 : (k / (count - 1)) * 2 - 1;
-    // Alternate rows are offset so seeds sit in a honeycomb pattern.
-    const off = row % 2 === 0 ? 0 : 0.5 / Math.max(count - 1, 1);
-    const fx = clamp(f + off * (Math.abs(f) < 0.9 ? 1 : 0), -0.95, 0.95);
-    const x = CX + fx * hw;
-    const s = 7.5 + (1 - Math.abs(fx)) * 2.5;
-    seeds.push({ x, y, s, rot: fx * 0.55 });
-  }
-}
-
-function seedAt(x: number, y: number): number {
-  // 1 inside a seed, 0 outside, feathered.
-  for (const sd of seeds) {
-    const dx = x - sd.x;
-    const dy = y - sd.y;
-    const c = Math.cos(sd.rot);
-    const s = Math.sin(sd.rot);
-    const rx = dx * c + dy * s;
-    const ry = -dx * s + dy * c;
-    const d = (rx * rx) / (sd.s * sd.s) + (ry * ry) / ((sd.s * 1.55) * (sd.s * 1.55));
-    if (d < 1.15) return clamp((1.15 - d) / 0.3, 0, 1);
-  }
-  return 0;
-}
-
-const RED_DEEP: RGB = [178, 18, 28];
-const RED_MID: RGB = [222, 52, 48];
-const RED_BRIGHT: RGB = [244, 96, 74];
-const RED_GLOW: RGB = [255, 138, 105];
-
-for (let y = TOP - 6; y <= BOT + 6; y++) {
-  for (let x = CX - 235; x <= CX + 235; x++) {
-    const inside = bodyAt(x, y);
-    if (inside <= 0) continue;
-    const t = clamp((y - TOP) / (BOT - TOP), 0, 1);
-    const nx = (x - CX) / halfWidth(t); // -1..1 across the body
-    // Light from the upper left: bright near (-0.45, 0.25), deep at the edges.
-    const lx = -0.45;
-    const ly = 0.22;
-    const dl = Math.sqrt((nx - lx) * (nx - lx) + (t - ly) * (t - ly) * 1.6);
-    let col = mix(RED_BRIGHT, RED_DEEP, clamp(dl * 0.85, 0, 1));
-    col = mix(col, RED_GLOW, clamp(1 - dl * 1.5, 0, 1) * 0.55);
-    // Ripen toward a deeper red near the tip.
-    col = mix(col, [196, 26, 34], t * t * 0.35);
-    // Seeds: pale golden pits with a warm shadow rim.
-    const sd = seedAt(x, y);
-    if (sd > 0) {
-      const pit = mix([214, 168, 92], [244, 214, 140], clamp(1 - dl, 0, 1) * 0.5);
-      col = mix(col, pit, sd * 0.92);
-    }
-    blend(x, y, col, inside);
-  }
-}
-
-// Glossy highlight: a soft diagonal shine on the upper-left shoulder.
-ellipse(368, 392, 66, 118, [255, 214, 190], 0.34, 34);
-ellipse(352, 372, 34, 62, [255, 236, 214], 0.42, 20);
-ellipse(338, 348, 15, 30, [255, 248, 238], 0.55, 10);
-// A faint second sheen low on the right, as if light bounces off the table.
-ellipse(560, 640, 42, 84, [255, 160, 130], 0.14, 26);
-
-// Warm rim light along the body's right edge, and a deeper shade at the tip,
-// so the berry lifts off the background instead of sitting flat.
-for (let y = TOP + 40; y <= BOT; y++) {
-  const t = clamp((y - TOP) / (BOT - TOP), 0, 1);
-  const hw = halfWidth(t);
-  const rimX = Math.round(CX + hw * 0.97);
-  const strength = 0.5 * (1 - Math.abs(t - 0.45));
-  blend(rimX, y, [255, 120, 88], strength * 0.55);
-  blend(rimX - 1, y, [255, 120, 88], strength * 0.3);
-  blend(rimX + 1, y, [255, 120, 88], strength * 0.3);
-  // Deepen the very tip so the point reads rounded, not cut off.
-  if (t > 0.9) {
-    const tipShade = (t - 0.9) / 0.1;
-    const x0 = Math.round(CX - hw * 0.5);
-    const x1 = Math.round(CX + hw * 0.5);
-    for (let x = x0; x <= x1; x++) {
-      if (bodyAt(x, y) > 0) blend(x, y, [150, 14, 24], tipShade * 0.25);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Calyx: green sepals fanning over the top of the berry
-// ---------------------------------------------------------------------------
-function leaf(x0: number, y0: number, x1: number, y1: number, w: number, c: RGB): void {
-  // A tapered leaf drawn as a filled triangle strip from base to tip.
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len = Math.sqrt(dx * dx + dy * dy);
-  const ux = dx / len;
-  const uy = dy / len;
-  const pxn = -uy;
-  const pyn = ux;
-  const steps = Math.ceil(len);
-  for (let i = 0; i <= steps; i++) {
-    const f = i / steps;
-    const bx = x0 + dx * f;
-    const by = y0 + dy * f;
-    const half = w * Math.sin(Math.PI * Math.pow(f, 0.7)) * (1 - f * 0.25);
-    for (let o = -half; o <= half; o += 1) {
-      blend(Math.round(bx + pxn * o), Math.round(by + pyn * o), c, 0.96);
-    }
-  }
-}
-
-const GREEN: RGB = [46, 125, 52];
-const GREEN_LIGHT: RGB = [86, 168, 74];
-const GREEN_DARK: RGB = [30, 92, 38];
-
-leaf(450, 316, 300, 268, 26, GREEN_DARK);
-leaf(450, 316, 372, 238, 26, GREEN);
-leaf(450, 316, 450, 222, 28, GREEN_LIGHT);
-leaf(450, 316, 528, 238, 26, GREEN);
-leaf(450, 316, 600, 268, 26, GREEN_DARK);
-leaf(450, 316, 338, 306, 20, GREEN);
-leaf(450, 316, 562, 306, 20, GREEN);
-// Centre rosette where the leaves meet.
-ellipse(450, 312, 42, 20, GREEN_LIGHT, 1, 8);
-ellipse(450, 308, 26, 12, GREEN, 1, 6);
-
-// Stem, leaning slightly right, with a warm highlight.
-for (let i = 0; i <= 60; i++) {
-  const f = i / 60;
-  const sx = 450 + f * 26;
-  const sy = 306 - f * 62;
-  ellipse(sx, sy, 7 - f * 2, 7 - f * 2, [96, 74, 44], 1, 3);
-  ellipse(sx - 2, sy, 2.5, 3.5, [150, 120, 80], 0.8, 2);
-}
-
-// A few juice droplets catching the light on the skin.
-ellipse(520, 470, 7, 10, [255, 220, 200], 0.75, 4);
-ellipse(396, 560, 6, 8, [255, 220, 200], 0.7, 4);
-ellipse(492, 690, 5, 7, [255, 210, 190], 0.65, 3);
-
-// ---------------------------------------------------------------------------
-// PNG encoding (stdlib only: node:zlib deflate + hand-rolled CRC32)
+// CRC32 (the PNG chunk checksum), implemented by hand.
 // ---------------------------------------------------------------------------
 const CRC_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
@@ -285,6 +20,7 @@ for (let n = 0; n < 256; n++) {
   for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
   CRC_TABLE[n] = c >>> 0;
 }
+
 function crc32(buf: Buffer): number {
   let c = 0xffffffff;
   for (let i = 0; i < buf.length; i++) {
@@ -292,41 +28,276 @@ function crc32(buf: Buffer): number {
   }
   return (c ^ 0xffffffff) >>> 0;
 }
+
+// ---------------------------------------------------------------------------
+// PNG encoder: 8-bit RGB, filter byte 0 on every scanline.
+// ---------------------------------------------------------------------------
 function chunk(type: string, data: Buffer): Buffer {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, "ascii");
-  data.copy(out, 8);
-  const crc = crc32(Buffer.concat([Buffer.from(type, "ascii"), data]));
-  out.writeUInt32BE(crc, 8 + data.length);
-  return out;
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, "ascii");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
 }
 
-function writePng(path: string): void {
-  const raw = Buffer.alloc(H * (1 + W * 3));
-  for (let y = 0; y < H; y++) {
-    raw[y * (1 + W * 3)] = 0; // filter: none
-    raw.set(px.subarray(y * W * 3, (y + 1) * W * 3), y * (1 + W * 3) + 1);
-  }
+function encodePng(width: number, height: number, rgb: Buffer): Buffer {
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(W, 0);
-  ihdr.writeUInt32BE(H, 4);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type: truecolour RGB
-  const png = Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  ihdr[9] = 2; // colour type 2 = truecolour RGB
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+
+  // Each scanline is one filter byte (0) followed by width * 3 bytes.
+  const raw = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y++) {
+    const dst = y * (1 + width * 3);
+    raw[dst] = 0;
+    rgb.copy(raw, dst + 1, y * width * 3, (y + 1) * width * 3);
+  }
+  const idat = deflateSync(raw, { level: 9 });
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  return Buffer.concat([
+    signature,
     chunk("IHDR", ihdr),
-    chunk("IDAT", deflateSync(raw, { level: 9 })),
+    chunk("IDAT", idat),
     chunk("IEND", Buffer.alloc(0)),
   ]);
-  writeFileSync(path, png);
-  const hash = createHash("sha256").update(png).digest("hex");
-  console.log(`wrote ${path} (${png.length} bytes, ${W}x${H}, sha256 ${hash.slice(0, 16)}...)`);
 }
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Tiny rasterizer helpers.
 // ---------------------------------------------------------------------------
-const outDir = process.env.OUTPUT_DIR || "/output";
+type RGB = [number, number, number];
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function mix(c1: RGB, c2: RGB, t: number): RGB {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+}
+
+/** Smoothstep edge: 1 inside, 0 outside, soft over `soft` pixels. */
+function smoothEdge(d: number, soft: number): number {
+  const t = clamp(0.5 - d / soft, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+const W = 800;
+const H = 800;
+const px = new Float32Array(W * H * 3);
+
+function setPixel(x: number, y: number, c: RGB): void {
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) * 3;
+  px[i] = c[0];
+  px[i + 1] = c[1];
+  px[i + 2] = c[2];
+}
+
+function blendPixel(x: number, y: number, c: RGB, alpha: number): void {
+  if (alpha <= 0) return;
+  if (x < 0 || y < 0 || x >= W || y >= H) return;
+  const i = (y * W + x) * 3;
+  px[i] = lerp(px[i], c[0], alpha);
+  px[i + 1] = lerp(px[i + 1], c[1], alpha);
+  px[i + 2] = lerp(px[i + 2], c[2], alpha);
+}
+
+/** Fill an ellipse (soft edge) with a solid colour. */
+function ellipse(
+  cx: number, cy: number, rx: number, ry: number,
+  rot: number, c: RGB, alpha = 1,
+): void {
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  const x0 = Math.max(0, Math.floor(cx - rx - 4));
+  const x1 = Math.min(W - 1, Math.ceil(cx + rx + 4));
+  const y0 = Math.max(0, Math.floor(cy - ry - 4));
+  const y1 = Math.min(H - 1, Math.ceil(cy + ry + 4));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      const u = (dx * cos + dy * sin) / rx;
+      const v = (-dx * sin + dy * cos) / ry;
+      const d = Math.sqrt(u * u + v * v) - 1;
+      const a = smoothEdge(d, 0.02) * alpha;
+      if (a > 0) blendPixel(x, y, c, a);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Background: warm cream, gently darker toward the edges.
+// ---------------------------------------------------------------------------
+const BG_TOP: RGB = [253, 238, 214];
+const BG_BOTTOM: RGB = [240, 205, 160];
+for (let y = 0; y < H; y++) {
+  const t = y / (H - 1);
+  const row = mix(BG_TOP, BG_BOTTOM, t * t * 0.9 + t * 0.1);
+  for (let x = 0; x < W; x++) {
+    // Soft vignette: darken the corners a touch so the eye stays central.
+    const dx = (x - W / 2) / (W / 2);
+    const dy = (y - H / 2) / (H / 2);
+    const r = Math.sqrt(dx * dx + dy * dy);
+    const vig = 1 - 0.10 * clamp((r - 0.55) / 0.45, 0, 1);
+    setPixel(x, y, [row[0] * vig, row[1] * vig, row[2] * vig]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Warm glow behind the berry, so it pops off the cream background.
+// ---------------------------------------------------------------------------
+ellipse(400, 420, 330, 330, 0, [255, 226, 170], 0.35);
+ellipse(400, 420, 290, 290, 0, [255, 232, 185], 0.30);
+
+// ---------------------------------------------------------------------------
+// Soft shadow under the berry.
+// ---------------------------------------------------------------------------
+ellipse(400, 668, 235, 42, 0, [120, 70, 35], 0.28);
+ellipse(400, 664, 190, 30, 0, [120, 70, 35], 0.22);
+
+// ---------------------------------------------------------------------------
+// The strawberry body: a wide heart shape, widest near the top, tapering
+// to a rounded point at the bottom. Signed distance in normalised space.
+// ---------------------------------------------------------------------------
+const BODY_CX = 400;
+const BODY_CY = 430;
+const BODY_RX = 255;
+const BODY_RY = 265;
+
+/** >0 inside the berry, 0 on its edge, <0 outside (normalised units). */
+function berryInside(nx: number, ny: number): number {
+  // Heart-ish profile: shoulders bulge near the top, tip at the bottom.
+  const y = ny; // -1 top .. +1 bottom
+  const shoulder = 1 - 0.28 * Math.max(0, -y) * Math.max(0, -y);
+  const taper = 1 - 0.55 * Math.pow(Math.max(0, y), 1.6);
+  const w = shoulder * taper;
+  const d = Math.sqrt((nx / w) * (nx / w) + y * y) - 1;
+  return -d;
+}
+
+const RED_DEEP: RGB = [168, 18, 32];
+const RED_MID: RGB = [214, 38, 48];
+const RED_BRIGHT: RGB = [238, 92, 66];
+const RED_DARK: RGB = [120, 10, 24];
+
+for (let y = 150; y < 700; y++) {
+  for (let x = 120; x < 680; x++) {
+    const nx = (x + 0.5 - BODY_CX) / BODY_RX;
+    const ny = (y + 0.5 - BODY_CY) / BODY_RY;
+    const inside = berryInside(nx, ny);
+    if (inside <= -0.02) continue;
+    // Warm light from the upper left: bright there, deep red at the edges.
+    // Three-stop gradient: deep red in shadow, mid red, bright lit red.
+    const light = clamp(0.5 - nx * 0.55 - ny * 0.25, 0, 1);
+    let c = light < 0.5
+      ? mix(RED_DEEP, RED_MID, light * 2)
+      : mix(RED_MID, RED_BRIGHT, (light - 0.5) * 2);
+    // Darken the rim for roundness.
+    const rim = clamp(inside / 0.25, 0, 1);
+    c = mix(RED_DARK, c, rim);
+    // A faint vertical sheen down the lit side.
+    const sheen = Math.exp(-Math.pow((nx + 0.45) * 3.2, 2)) * 0.25;
+    c = mix(c, [255, 150, 120], sheen * clamp(light, 0, 1));
+    const a = smoothEdge(-inside, 0.03);
+    blendPixel(x, y, c, a);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Seeds: pale achenes dotted over the berry in gentle rows.
+// ---------------------------------------------------------------------------
+function seedAt(sx: number, sy: number, scale: number, rot: number): void {
+  // Seed sits only where the berry surface is.
+  const nx = (sx - BODY_CX) / BODY_RX;
+  const ny = (sy - BODY_CY) / BODY_RY;
+  if (berryInside(nx, ny) < 0.06) return;
+  // Pale gold pit with a darker rim.
+  ellipse(sx, sy, 9 * scale, 13 * scale, rot, [214, 150, 60], 0.9);
+  ellipse(sx, sy - 1, 6.5 * scale, 10 * scale, rot, [250, 226, 150], 0.95);
+  ellipse(sx - 1, sy - 3, 2.5 * scale, 4 * scale, rot, [255, 244, 200], 0.9);
+}
+
+const seedRows = [
+  { y: 300, n: 4, s: 0.85 },
+  { y: 345, n: 5, s: 0.95 },
+  { y: 395, n: 6, s: 1.0 },
+  { y: 445, n: 6, s: 1.0 },
+  { y: 495, n: 5, s: 0.95 },
+  { y: 545, n: 4, s: 0.9 },
+  { y: 590, n: 3, s: 0.8 },
+];
+for (const row of seedRows) {
+  for (let i = 0; i < row.n; i++) {
+    const t = row.n === 1 ? 0.5 : i / (row.n - 1);
+    const sx = 400 + (t - 0.5) * 2 * (BODY_RX * 0.72) * (1 - Math.abs(row.y - 430) / 900);
+    const sy = row.y + (i % 2 === 0 ? 3 : -3);
+    const rot = (sx - 400) / 400 * 0.5;
+    seedAt(sx, sy, row.s, rot);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gloss: two soft white highlights on the lit upper-left shoulder.
+// ---------------------------------------------------------------------------
+ellipse(318, 300, 62, 34, -0.6, [255, 255, 255], 0.55);
+ellipse(292, 330, 30, 16, -0.6, [255, 255, 255], 0.45);
+ellipse(470, 265, 26, 14, 0.4, [255, 235, 220], 0.30);
+
+// ---------------------------------------------------------------------------
+// Calyx: green leaflets fanning over the top of the berry, plus a stem.
+// ---------------------------------------------------------------------------
+const LEAF: RGB = [46, 125, 50];
+const LEAF_LIGHT: RGB = [86, 168, 74];
+const LEAF_DARK: RGB = [28, 84, 32];
+
+// Stem first (behind the leaves).
+ellipse(400, 158, 9, 30, 0.12, [74, 110, 52], 1);
+
+// Five pointed leaflets, fanning out from the crown.
+const leaflets = [
+  { cx: 400, cy: 196, rx: 26, ry: 62, rot: 0.0 },
+  { cx: 330, cy: 206, rx: 24, ry: 56, rot: -0.75 },
+  { cx: 470, cy: 206, rx: 24, ry: 56, rot: 0.75 },
+  { cx: 300, cy: 220, rx: 20, ry: 44, rot: -1.05 },
+  { cx: 500, cy: 220, rx: 20, ry: 44, rot: 1.05 },
+];
+for (const leaf of leaflets) {
+  ellipse(leaf.cx, leaf.cy, leaf.rx, leaf.ry, leaf.rot, LEAF, 1);
+}
+// Light on the upper leaflets.
+ellipse(392, 178, 18, 34, 0.1, LEAF_LIGHT, 0.8);
+ellipse(336, 190, 14, 28, -0.7, LEAF_LIGHT, 0.6);
+ellipse(466, 190, 14, 28, 0.7, LEAF_LIGHT, 0.6);
+// Crown centre where the leaflets meet.
+ellipse(400, 210, 34, 20, 0, LEAF_DARK, 0.9);
+
+// A couple of juice droplets on the lit shoulder for freshness.
+ellipse(352, 372, 7, 10, 0, [255, 255, 255], 0.5);
+ellipse(352, 370, 3.5, 5, 0, [255, 255, 255], 0.8);
+ellipse(452, 420, 6, 8, 0, [255, 255, 255], 0.45);
+
+// ---------------------------------------------------------------------------
+// Write the PNG.
+// ---------------------------------------------------------------------------
+const rgb = Buffer.alloc(W * H * 3);
+for (let i = 0; i < W * H * 3; i++) {
+  rgb[i] = clamp(Math.round(px[i]), 0, 255);
+}
+const png = encodePng(W, H, rgb);
+
+const outDir = process.env.OUTPUT_DIR ?? "/output";
 mkdirSync(outDir, { recursive: true });
-writePng(join(outDir, "entry.png"));
+const outPath = join(outDir, "entry.png");
+writeFileSync(outPath, png);
+console.log(`wrote ${outPath}: ${png.length} bytes, ${W}x${H}`);
